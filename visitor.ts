@@ -1,80 +1,145 @@
 import * as fs from 'fs';
-import * as ts from 'typescript';
-import {replacement} from './replace_scope';
+import * as path from 'path';
+import {
+    Bundle,
+    createPrinter,
+    createSourceFile,
+    Node,
+    ScriptKind,
+    ScriptTarget,
+    SourceFile,
+    SyntaxKind,
+    transform,
+    TransformationContext,
+    TransformationResult,
+    visitEachChild,
+    visitNode,
+    VisitResult
+} from 'typescript';
+// import {replacements} from './replace_scope';
+// import {replacements} from './service_mocks';
 import {SyntaxKindKeys} from './syntax_kind';
 
 export type SyntaxKindKey = {
-    [key in keyof SyntaxKindKeys]: SyntaxKindKey | ITransform
-    }
-
-export type Visitor = (node: ts.Node) => ts.Node;
-
-export interface ITransform {
-    visit?(node: ts.Node): ts.Node;
-
-    leave?(node: ts.Node): ts.Node;
-
-    [key: string]: Transformer;
+    [key: string]: Transformer
 }
 
-export type Transformer = SyntaxKindKey | ITransform | Visitor;
+export type Visitor = (node: Node) => Node;
+
+export interface ITransform {
+    visit?(node: Node): Node;
+
+    leave?(node: Node): Node;
+
+    filter?(node: Node): boolean;
+}
+
+export type Transformer = ITransform | Visitor;
+
+const Kinds = new SyntaxKindKeys();
+
+export function logNode(node: Node, full = false) {
+    const [kind] = Object.keys(Kinds).filter(key => Kinds[key] === node.kind);
+    console.log(`${kind} (${node.kind})`);
+    if (full) {
+        console.log(console.log(node));
+    }
+}
 
 export class Traversal {
 
-    private static keys = new SyntaxKindKeys();
-
-    constructor(private node: ts.Node) {
+    constructor(private node: Node) {
     }
 
-    traverse(r: Transformer): ts.TransformationResult<ts.Node> {
-        const transformer = <T extends ts.Node>(context: ts.TransformationContext) =>
+    traverse(r: Transformer): TransformationResult<Node> {
+        const transformer = <T extends Node>(context: TransformationContext) =>
             (rootNode: T) => {
-                return ts.visitNode(rootNode, (node) => this.doTraverse(context, node, r));
+                return visitNode(rootNode, (node) => this.traverseChild(node, r, context));
             };
-        return ts.transform<ts.Node>(this.node, [transformer]);
+        return transform<Node>(this.node, [transformer]);
     }
 
-    doTraverse(context: ts.TransformationContext, rootNode: ts.Node, r: Transformer): ts.Node {
+    traverseChild(node: Node, transformer: Transformer, context: TransformationContext): VisitResult<Node> {
+        for (let key of Object.keys(transformer)) {
+            if (key === 'visit' || key === 'leave' || key === 'filter' || key.indexOf('_') === 0) {
+                continue;
+            }
+
+            const t = transformer[key] as ITransform;
+
+            if (node.kind === Kinds[key] && (!t.filter || t.filter(node))) {
+                logNode(node);
+                return this.doTraverse(context, node, transformer[key]);
+            }
+        }
+
+        return visitEachChild(node, (n) => this.traverseChild(n, transformer, context), context);
+    }
+
+    doTraverse(context: TransformationContext, rootNode: Node, r: Transformer): VisitResult<Node> {
         const transformer = r as ITransform;
-        let result: ts.Node = rootNode;
+        let result: Node | Node[] = rootNode;
 
         if (transformer.visit) {
-            console.log(`visit (kind=${rootNode.kind})`);
+            // console.log(`visit (kind=${rootNode.kind})`);
             result = transformer.visit(rootNode);
         }
 
-        const traverseResult = ts.visitEachChild(rootNode, (node: ts.Node) => {
-            for (let key of Object.keys(r)) {
-                if (key === 'visit' || key === 'leave') {
-                    continue;
-                }
-
-                console.log(`key=${key} kind=${node.kind} keyKind=${Traversal.keys[key]}`);
-                if (node.kind === Traversal.keys[key]) {
-                    console.log('match, traversing');
-                    return this.doTraverse(context, node, r[key]);
-                }
-            }
-
-            return node;
-        }, context);
-
+        const traverseResult = visitEachChild(rootNode, (node) => this.traverseChild(node, r, context), context);
 
         if (transformer.leave) {
-            console.log('leave');
-            result = transformer.leave(result);
+            // console.log('leave');
+            result = transformer.leave(traverseResult);
         }
 
         return result === rootNode ? traverseResult : result;
     }
 }
 
-const sourceFile = ts.createSourceFile(
-    'example.ts',
-    fs.readFileSync('./example.ts').toString(),
-    ts.ScriptTarget.ES2015,
-    true,
-    ts.ScriptKind.TS
-);
+export function transformFile(inputPath: string, outputPath: string, replacements: (ITransform & { [key: string]: any })[]) {
+    const filename = path.basename(inputPath);
+    const sourceFile = createSourceFile(
+        filename,
+        fs.readFileSync(inputPath).toString(),
+        ScriptTarget.ES2015,
+        true,
+        ScriptKind.TS
+    );
 
-new Traversal(sourceFile).traverse(replacement);
+    let result: TransformationResult<Node>;
+    for (let replacement of replacements) {
+        result = new Traversal(result ? result.transformed[0] : sourceFile).traverse(replacement);
+    }
+
+    const printer = createPrinter();
+
+    const print = (sourceFile: SourceFile) => {
+        const content = printer.printFile(sourceFile);
+
+        // console.log('=============================================');
+        // console.log(content);
+        // console.log('=============================================');
+
+        fs.writeFileSync(path.join(outputPath, sourceFile.fileName), content);
+    };
+
+    for (let node of result.transformed) {
+        logNode(node);
+
+        switch (node.kind) {
+            case SyntaxKind.Bundle:
+                const bundle = node as Bundle;
+
+                for (let file of bundle.sourceFiles) {
+                    print(file);
+                }
+                break;
+            case SyntaxKind.SourceFile:
+                print(node as SourceFile);
+                break;
+            default:
+                console.log('Cannot print this node');
+        }
+    }
+
+}
